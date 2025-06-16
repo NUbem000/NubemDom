@@ -1,0 +1,61 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+.nuxt/
+.cache/
+
+# Logs
+logs/
+*.log
+
+# Testing
+coverage/
+.nyc_output/
+
+# GCP
+service-account-key.json
+gcp-credentials.json
+.gcloudignore
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OCR uploads
+uploads/
+processed/
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+
+# OS files
+Thumbs.db
+.DS_Store
