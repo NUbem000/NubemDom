@@ -4,17 +4,67 @@ const helmet = require('helmet');
 const compression = require('compression');
 const multer = require('multer');
 const path = require('path');
+const winston = require('winston');
 require('dotenv').config();
+
+// Import services
+const VisionService = require('./services/vision');
+const FirestoreService = require('./services/firestore');
+const { verifyToken, optionalAuth, createUserRateLimit } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Initialize services
+const visionService = new VisionService();
+const firestoreService = new FirestoreService();
+
+// Logger configuration
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: 'nubemdom-api' },
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.simple()
+    })
+  ]
+});
+
 // Middleware
-app.use(helmet());
-app.use(cors());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  }
+}));
+
+app.use(cors({
+  origin: process.env.FRONTEND_URL || ['http://localhost:3000', 'http://localhost:3001'],
+  credentials: true
+}));
+
 app.use(compression());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Request logging
+app.use((req, res, next) => {
+  logger.info(`${req.method} ${req.path}`, {
+    ip: req.ip,
+    userAgent: req.get('User-Agent'),
+    userId: req.user?.uid
+  });
+  next();
+});
 
 // Multer configuration for file uploads
 const storage = multer.memoryStorage();
@@ -33,9 +83,9 @@ const upload = multer({
   }
 });
 
-// Initialize services (will be implemented)
-// const visionService = require('./services/vision');
-// const firestoreService = require('./services/firestore');
+// Rate limiting
+const apiRateLimit = createUserRateLimit(100, 15 * 60 * 1000); // 100 requests per 15 minutes
+const uploadRateLimit = createUserRateLimit(20, 15 * 60 * 1000); // 20 uploads per 15 minutes
 
 // Routes
 app.get('/', (req, res) => {
@@ -64,121 +114,305 @@ app.get('/health', (req, res) => {
 });
 
 // Upload receipt endpoint
-app.post('/api/receipts/upload', upload.single('receipt'), async (req, res) => {
+app.post('/api/receipts/upload', verifyToken, uploadRateLimit, upload.single('receipt'), async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      return res.status(400).json({ 
+        error: 'No file uploaded',
+        code: 'NO_FILE'
+      });
     }
 
-    // TODO: Process with Vision API
-    // const ocrResult = await visionService.extractText(req.file.buffer);
-    // const parsedData = await visionService.parseReceiptData(ocrResult);
-    // const savedReceipt = await firestoreService.saveReceipt(parsedData);
-
-    // Mock response for now
-    const mockReceipt = {
-      id: Date.now().toString(),
-      uploadedAt: new Date().toISOString(),
+    logger.info('Processing receipt upload', {
+      userId: req.user.uid,
       filename: req.file.originalname,
-      status: 'processing',
-      extractedData: {
-        vendor: 'Supermercado Example',
-        date: new Date().toISOString().split('T')[0],
-        total: 45.67,
-        items: [
-          { name: 'Producto 1', price: 12.50 },
-          { name: 'Producto 2', price: 33.17 }
-        ]
-      }
+      size: req.file.size
+    });
+
+    // Initialize storage bucket if needed
+    await visionService.initializeBucket();
+
+    // Save image to Cloud Storage
+    const imageData = await visionService.saveReceiptImage(
+      req.file.buffer, 
+      req.file.originalname
+    );
+
+    // Extract text using Vision API
+    const textResult = await visionService.extractText(req.file.buffer);
+    
+    // Parse receipt data
+    const parsedData = visionService.parseReceiptData(textResult);
+    
+    // Add image metadata
+    const receiptData = {
+      ...parsedData,
+      filename: req.file.originalname,
+      imageUrl: imageData.url,
+      imagePath: imageData.fileName,
+      fileSize: req.file.size,
+      mimeType: req.file.mimetype,
+      uploadedAt: new Date().toISOString()
     };
+
+    // Save to Firestore
+    const savedReceipt = await firestoreService.saveReceipt(receiptData, req.user.uid);
+
+    logger.info('Receipt processed successfully', {
+      userId: req.user.uid,
+      receiptId: savedReceipt.id,
+      vendor: savedReceipt.vendor,
+      total: savedReceipt.total
+    });
 
     res.json({
       success: true,
-      receipt: mockReceipt
+      receipt: savedReceipt
     });
+
   } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Failed to process receipt' });
+    logger.error('Receipt upload error', {
+      userId: req.user?.uid,
+      error: error.message,
+      stack: error.stack
+    });
+
+    let statusCode = 500;
+    let errorCode = 'PROCESSING_ERROR';
+    let message = 'Failed to process receipt';
+
+    if (error.message.includes('Vision API')) {
+      errorCode = 'OCR_ERROR';
+      message = 'Failed to extract text from image';
+    } else if (error.message.includes('storage')) {
+      errorCode = 'STORAGE_ERROR';
+      message = 'Failed to save image';
+    } else if (error.message.includes('database')) {
+      errorCode = 'DATABASE_ERROR';
+      message = 'Failed to save receipt data';
+    }
+
+    res.status(statusCode).json({ 
+      error: message,
+      code: errorCode
+    });
   }
 });
 
 // Get all receipts
-app.get('/api/receipts', async (req, res) => {
+app.get('/api/receipts', verifyToken, apiRateLimit, async (req, res) => {
   try {
-    // TODO: Fetch from Firestore
-    // const receipts = await firestoreService.getReceipts(req.query);
-    
-    // Mock response
-    const mockReceipts = [
-      {
-        id: '1',
-        vendor: 'Supermercado A',
-        date: '2024-01-15',
-        total: 125.50,
-        category: 'Alimentación'
-      },
-      {
-        id: '2',
-        vendor: 'Gasolinera B',
-        date: '2024-01-14',
-        total: 60.00,
-        category: 'Transporte'
-      }
-    ];
+    const options = {
+      limit: parseInt(req.query.limit) || 20,
+      offset: parseInt(req.query.offset) || 0,
+      category: req.query.category,
+      startDate: req.query.startDate,
+      endDate: req.query.endDate,
+      minAmount: req.query.minAmount ? parseFloat(req.query.minAmount) : undefined,
+      maxAmount: req.query.maxAmount ? parseFloat(req.query.maxAmount) : undefined,
+      search: req.query.search
+    };
 
-    res.json({
-      receipts: mockReceipts,
-      total: mockReceipts.length
-    });
+    const result = await firestoreService.getReceipts(req.user.uid, options);
+
+    res.json(result);
   } catch (error) {
-    console.error('Fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch receipts' });
+    logger.error('Get receipts error', {
+      userId: req.user.uid,
+      error: error.message
+    });
+    
+    res.status(500).json({ 
+      error: 'Failed to fetch receipts',
+      code: 'FETCH_ERROR'
+    });
+  }
+});
+
+// Get single receipt
+app.get('/api/receipts/:id', verifyToken, apiRateLimit, async (req, res) => {
+  try {
+    const receipt = await firestoreService.getReceipt(req.params.id, req.user.uid);
+    res.json({ receipt });
+  } catch (error) {
+    logger.error('Get receipt error', {
+      userId: req.user.uid,
+      receiptId: req.params.id,
+      error: error.message
+    });
+
+    if (error.message === 'Receipt not found') {
+      return res.status(404).json({ 
+        error: 'Receipt not found',
+        code: 'NOT_FOUND'
+      });
+    }
+
+    if (error.message === 'Access denied') {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        code: 'ACCESS_DENIED'
+      });
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to fetch receipt',
+      code: 'FETCH_ERROR'
+    });
+  }
+});
+
+// Update receipt
+app.put('/api/receipts/:id', verifyToken, apiRateLimit, async (req, res) => {
+  try {
+    const { vendor, total, category, date, items, verified } = req.body;
+    
+    const updateData = {};
+    if (vendor !== undefined) updateData.vendor = vendor;
+    if (total !== undefined) updateData.total = parseFloat(total);
+    if (category !== undefined) updateData.category = category;
+    if (date !== undefined) updateData.date = date;
+    if (items !== undefined) updateData.items = items;
+    if (verified !== undefined) updateData.verified = verified;
+
+    const receipt = await firestoreService.updateReceipt(
+      req.params.id, 
+      updateData, 
+      req.user.uid
+    );
+
+    logger.info('Receipt updated', {
+      userId: req.user.uid,
+      receiptId: req.params.id,
+      updates: Object.keys(updateData)
+    });
+
+    res.json({ receipt });
+  } catch (error) {
+    logger.error('Update receipt error', {
+      userId: req.user.uid,
+      receiptId: req.params.id,
+      error: error.message
+    });
+
+    if (error.message === 'Receipt not found') {
+      return res.status(404).json({ 
+        error: 'Receipt not found',
+        code: 'NOT_FOUND'
+      });
+    }
+
+    if (error.message === 'Access denied') {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        code: 'ACCESS_DENIED'
+      });
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to update receipt',
+      code: 'UPDATE_ERROR'
+    });
+  }
+});
+
+// Delete receipt
+app.delete('/api/receipts/:id', verifyToken, apiRateLimit, async (req, res) => {
+  try {
+    await firestoreService.deleteReceipt(req.params.id, req.user.uid);
+
+    logger.info('Receipt deleted', {
+      userId: req.user.uid,
+      receiptId: req.params.id
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Delete receipt error', {
+      userId: req.user.uid,
+      receiptId: req.params.id,
+      error: error.message
+    });
+
+    if (error.message === 'Receipt not found') {
+      return res.status(404).json({ 
+        error: 'Receipt not found',
+        code: 'NOT_FOUND'
+      });
+    }
+
+    if (error.message === 'Access denied') {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        code: 'ACCESS_DENIED'
+      });
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to delete receipt',
+      code: 'DELETE_ERROR'
+    });
   }
 });
 
 // Get analytics
-app.get('/api/analytics', async (req, res) => {
+app.get('/api/analytics', verifyToken, apiRateLimit, async (req, res) => {
   try {
-    // TODO: Calculate from Firestore data
-    // const analytics = await firestoreService.getAnalytics(req.query);
-    
-    // Mock analytics
-    const mockAnalytics = {
+    const options = {
       period: req.query.period || 'month',
-      totalSpent: 1250.75,
-      averageDaily: 41.69,
-      topCategories: [
-        { name: 'Alimentación', amount: 650.50, percentage: 52 },
-        { name: 'Transporte', amount: 350.25, percentage: 28 },
-        { name: 'Servicios', amount: 250.00, percentage: 20 }
-      ],
-      trend: {
-        current: 1250.75,
-        previous: 1180.50,
-        change: 5.95
-      }
+      startDate: req.query.startDate,
+      endDate: req.query.endDate
     };
 
-    res.json(mockAnalytics);
+    const analytics = await firestoreService.getAnalytics(req.user.uid, options);
+    res.json(analytics);
   } catch (error) {
-    console.error('Analytics error:', error);
-    res.status(500).json({ error: 'Failed to fetch analytics' });
+    logger.error('Analytics error', {
+      userId: req.user.uid,
+      error: error.message
+    });
+    
+    res.status(500).json({ 
+      error: 'Failed to fetch analytics',
+      code: 'ANALYTICS_ERROR'
+    });
+  }
+});
+
+// Get user profile
+app.get('/api/profile', verifyToken, apiRateLimit, async (req, res) => {
+  try {
+    const profile = await firestoreService.getUserProfile(req.user.uid);
+    res.json({ profile });
+  } catch (error) {
+    logger.error('Profile error', {
+      userId: req.user.uid,
+      error: error.message
+    });
+    
+    res.status(500).json({ 
+      error: 'Failed to fetch profile',
+      code: 'PROFILE_ERROR'
+    });
   }
 });
 
 // Get categories
-app.get('/api/categories', (req, res) => {
-  res.json({
-    categories: [
-      { id: '1', name: 'Alimentación', icon: '🛒', color: '#10B981' },
-      { id: '2', name: 'Transporte', icon: '🚗', color: '#3B82F6' },
-      { id: '3', name: 'Servicios', icon: '💡', color: '#F59E0B' },
-      { id: '4', name: 'Salud', icon: '🏥', color: '#EF4444' },
-      { id: '5', name: 'Entretenimiento', icon: '🎬', color: '#8B5CF6' },
-      { id: '6', name: 'Hogar', icon: '🏠', color: '#EC4899' },
-      { id: '7', name: 'Otros', icon: '📦', color: '#6B7280' }
-    ]
-  });
+app.get('/api/categories', optionalAuth, async (req, res) => {
+  try {
+    const categories = await firestoreService.getCategories();
+    res.json({ categories });
+  } catch (error) {
+    logger.error('Categories error', {
+      userId: req.user?.uid,
+      error: error.message
+    });
+    
+    res.status(500).json({ 
+      error: 'Failed to fetch categories',
+      code: 'CATEGORIES_ERROR'
+    });
+  }
 });
 
 // Error handling middleware

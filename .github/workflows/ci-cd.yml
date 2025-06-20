@@ -1,0 +1,284 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PROJECT_ID: nubemdom
+  REGION: us-central1
+  BACKEND_SERVICE: nubemdom
+  FRONTEND_SERVICE: nubemdom-frontend
+
+jobs:
+  # Test Backend
+  test-backend:
+    runs-on: ubuntu-latest
+    name: Test Backend
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run linting
+      run: npm run lint
+    
+    - name: Run tests
+      run: npm test
+      env:
+        NODE_ENV: test
+
+  # Test Frontend
+  test-frontend:
+    runs-on: ubuntu-latest
+    name: Test Frontend
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install frontend dependencies
+      working-directory: ./frontend
+      run: npm ci
+    
+    - name: Run frontend linting
+      working-directory: ./frontend
+      run: npm run lint
+    
+    - name: Build frontend
+      working-directory: ./frontend
+      run: npm run build
+      env:
+        NEXT_PUBLIC_API_URL: https://nubemdom-cu2jmz6pgq-uc.a.run.app
+        NEXT_PUBLIC_FIREBASE_PROJECT_ID: nubemdom
+
+  # Security Scan
+  security-scan:
+    runs-on: ubuntu-latest
+    name: Security Scan
+    needs: [test-backend, test-frontend]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Build and Deploy Backend
+  deploy-backend:
+    runs-on: ubuntu-latest
+    name: Deploy Backend
+    needs: [test-backend, security-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        project_id: ${{ env.PROJECT_ID }}
+    
+    - name: Configure Docker
+      run: gcloud auth configure-docker
+    
+    - name: Build and deploy backend
+      run: |
+        # Build image
+        docker build -t gcr.io/$PROJECT_ID/$BACKEND_SERVICE:$GITHUB_SHA .
+        
+        # Push image
+        docker push gcr.io/$PROJECT_ID/$BACKEND_SERVICE:$GITHUB_SHA
+        
+        # Deploy to Cloud Run
+        gcloud run deploy $BACKEND_SERVICE \
+          --image gcr.io/$PROJECT_ID/$BACKEND_SERVICE:$GITHUB_SHA \
+          --region $REGION \
+          --platform managed \
+          --allow-unauthenticated \
+          --port 8080 \
+          --memory 1Gi \
+          --cpu 1 \
+          --max-instances 10 \
+          --min-instances 0 \
+          --set-env-vars="NODE_ENV=production,PROJECT_ID=$PROJECT_ID" \
+          --service-account nubemdom-sa@$PROJECT_ID.iam.gserviceaccount.com
+
+    - name: Get backend service URL
+      id: backend-url
+      run: |
+        URL=$(gcloud run services describe $BACKEND_SERVICE --region $REGION --format 'value(status.url)')
+        echo "url=$URL" >> $GITHUB_OUTPUT
+
+    - name: Test backend deployment
+      run: |
+        sleep 30
+        curl -f ${{ steps.backend-url.outputs.url }}/health || exit 1
+
+  # Build and Deploy Frontend
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    name: Deploy Frontend
+    needs: [test-frontend, deploy-backend]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        project_id: ${{ env.PROJECT_ID }}
+    
+    - name: Configure Docker
+      run: gcloud auth configure-docker
+    
+    - name: Build frontend Docker image
+      working-directory: ./frontend
+      run: |
+        # Create Dockerfile for frontend
+        cat > Dockerfile << 'EOF'
+        FROM node:20-alpine AS builder
+        WORKDIR /app
+        COPY package*.json ./
+        RUN npm ci --only=production
+        COPY . .
+        RUN npm run build
+        
+        FROM nginx:alpine
+        COPY --from=builder /app/build /usr/share/nginx/html
+        COPY nginx.conf /etc/nginx/nginx.conf
+        EXPOSE 80
+        CMD ["nginx", "-g", "daemon off;"]
+        EOF
+        
+        # Create nginx config
+        cat > nginx.conf << 'EOF'
+        events {
+          worker_connections 1024;
+        }
+        
+        http {
+          include /etc/nginx/mime.types;
+          default_type application/octet-stream;
+          
+          server {
+            listen 80;
+            server_name _;
+            root /usr/share/nginx/html;
+            index index.html;
+            
+            location / {
+              try_files $uri $uri/ /index.html;
+            }
+            
+            location /api {
+              proxy_pass https://nubemdom-cu2jmz6pgq-uc.a.run.app;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+            }
+          }
+        }
+        EOF
+        
+        # Build and push image
+        docker build -t gcr.io/$PROJECT_ID/$FRONTEND_SERVICE:$GITHUB_SHA .
+        docker push gcr.io/$PROJECT_ID/$FRONTEND_SERVICE:$GITHUB_SHA
+
+    - name: Deploy frontend to Cloud Run
+      run: |
+        gcloud run deploy $FRONTEND_SERVICE \
+          --image gcr.io/$PROJECT_ID/$FRONTEND_SERVICE:$GITHUB_SHA \
+          --region $REGION \
+          --platform managed \
+          --allow-unauthenticated \
+          --port 80 \
+          --memory 512Mi \
+          --cpu 1 \
+          --max-instances 5 \
+          --min-instances 0
+
+    - name: Get frontend service URL
+      id: frontend-url
+      run: |
+        URL=$(gcloud run services describe $FRONTEND_SERVICE --region $REGION --format 'value(status.url)')
+        echo "url=$URL" >> $GITHUB_OUTPUT
+
+  # Integration Tests
+  integration-tests:
+    runs-on: ubuntu-latest
+    name: Integration Tests
+    needs: [deploy-backend, deploy-frontend]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install test dependencies
+      run: npm install --save-dev @playwright/test
+    
+    - name: Run integration tests
+      run: |
+        # Basic API health check
+        BACKEND_URL=$(gcloud run services describe nubemdom --region us-central1 --format 'value(status.url)')
+        curl -f "$BACKEND_URL/health" || exit 1
+        
+        # Test categories endpoint
+        curl -f "$BACKEND_URL/api/categories" || exit 1
+        
+        echo "✅ Integration tests passed"
+
+  # Notification
+  notify-deployment:
+    runs-on: ubuntu-latest
+    name: Notify Deployment
+    needs: [deploy-backend, deploy-frontend, integration-tests]
+    if: always() && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Notify success
+      if: needs.deploy-backend.result == 'success' && needs.deploy-frontend.result == 'success'
+      run: |
+        echo "🚀 Deployment successful!"
+        echo "Backend: https://nubemdom-cu2jmz6pgq-uc.a.run.app"
+        echo "Frontend: TBD after frontend deployment"
+    
+    - name: Notify failure
+      if: needs.deploy-backend.result == 'failure' || needs.deploy-frontend.result == 'failure'
+      run: |
+        echo "❌ Deployment failed!"
+        exit 1
